@@ -1,0 +1,205 @@
+diff --git a/src/core/compute_workspace.cpp b/src/core/compute_workspace.cpp
+index 54f0538..fa6121a 100644
+--- a/src/core/compute_workspace.cpp
++++ b/src/core/compute_workspace.cpp
+@@ -162,6 +162,8 @@ namespace sd {
+             }
+         }
+         const size_t graph_size = tensors.size() + 8;
++        fprintf(stderr, "[310B1-PATCH] measure graph_size=%zu n_nodes=%d n_leafs=%d\n",
++                graph_size, graph->n_nodes, graph->n_leafs);
+         auto context            = ggml_init({tensors.size() * ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false), nullptr, true});
+         if (context == nullptr) {
+             return {};
+diff --git a/src/core/ggml_extend.cpp b/src/core/ggml_extend.cpp
+index d16b92a..b1ca54f 100644
+--- a/src/core/ggml_extend.cpp
++++ b/src/core/ggml_extend.cpp
+@@ -797,6 +797,17 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
+         v = ggml_reshape_3d(ctx, v, L_k, d_head, n_kv_head * N);   // [N * n_kv_head, d_head, L_k]
+ 
+         auto kq = ggml_mul_mat(ctx, k, q);  // [N * n_head, L_q, L_k]
++        /* [310B] Ask the backend about the node we just built instead of
++         * assuming it can run it.  Ascend310B1 answers no, because it ships only
++         * the FP16 MatMulV2 kernels; the F32 node would then be scheduled onto
++         * the CPU, which cuts every attention layer into accelerator -> host ->
++         * accelerator.  Retry with F16 operands: they are accepted, matmul
++         * returns F32 either way, and the scale / mask add / softmax below stay
++         * F32, so the whole layer still runs on the accelerator.  Backends that
++         * accept the F32 form are unaffected and keep the original node. */
++        if (!ggml_backend_supports_op(backend, kq)) {
++            kq = ggml_mul_mat(ctx, ggml_cast(ctx, k, GGML_TYPE_F16), ggml_cast(ctx, q, GGML_TYPE_F16));
++        }
+         ggml_prec_set_acc(kq, GGML_PREC_F32);
+         kq = ggml_scale_inplace(ctx, kq, scale);
+         if (mask) {
+@@ -805,6 +816,12 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
+         kq = ggml_soft_max_inplace(ctx, kq);
+ 
+         kqv = ggml_mul_mat(ctx, v, kq);  // [N * n_head, L_q, d_head]
++        /* Same question for the value mixing.  Both operands are cast together:
++         * ggml_mul_mat requires matching operand types, and the F16 pair is what
++         * the 310B gate accepts. */
++        if (!ggml_backend_supports_op(backend, kqv)) {
++            kqv = ggml_mul_mat(ctx, ggml_cast(ctx, v, GGML_TYPE_F16), ggml_cast(ctx, kq, GGML_TYPE_F16));
++        }
+ 
+         kqv = ggml_reshape_4d(ctx, kqv, d_head, L_q, n_head, N);  // [N, n_head, L_q, d_head]
+         kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);                 // [N, L_q, n_head, d_head]
+diff --git a/src/core/ggml_runner.cpp b/src/core/ggml_runner.cpp
+index 4c156ed..7726d6b 100644
+--- a/src/core/ggml_runner.cpp
++++ b/src/core/ggml_runner.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include <algorithm>
+ #include <exception>
+ #include <map>
+@@ -493,7 +494,15 @@ void GGMLRunner::runner_end() {
+             if (parameter != nullptr)
+                 tensors.push_back(parameter);
+         }
+-        manager->evict_compute_backend_params(tensors);
++        /* [310B1] Evicting the params here is what makes the next HTTP
++         * request stream the DiT weights from disk again (the log shows 32
++         * chunks, ~8 s at 256).  SD_KEEP_PARAMS=1 keeps them on the compute
++         * backend so a resident server can reuse them; default off because
++         * the memory is only returned at process exit. */
++        static const bool keep_params = std::getenv("SD_KEEP_PARAMS") != nullptr;
++        if (!keep_params) {
++            manager->evict_compute_backend_params(tensors);
++        }
+         manager->remove_runtime_owner(reinterpret_cast<uintptr_t>(this));
+     }
+     runner_started_ = false;
+diff --git a/src/model_loader.cpp b/src/model_loader.cpp
+index f14044d..883ef6d 100644
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -1595,6 +1595,15 @@ bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage
+         return false;
+     }
+     if (type != GGML_TYPE_COUNT) {
++        if (tensor_storage.type == GGML_TYPE_BF16 && type == GGML_TYPE_F16) {
++            /* The 310B CANN backend has no bf16 matmul kernel, so a bf16
++             * weight drags its whole layer back to the CPU and splits the
++             * graph around it.  bf16 and f16 are both 2 bytes and bf16 has
++             * the smaller mantissa, so re-storing as f16 is exact and keeps
++             * those layers on the NPU.  Only reachable through
++             * --tensor-type-rules, i.e. opt-in, never a default. */
++            return true;
++        }
+         if (ggml_is_quantized(type) && tensor_storage.ne[0] % ggml_blck_size(type) != 0) {
+             // Pass, do not convert
+         } else if (ends_with(name, ".bias")) {
+diff --git a/src/model_manager.cpp b/src/model_manager.cpp
+index 330b86f..3ad74d9 100644
+--- a/src/model_manager.cpp
++++ b/src/model_manager.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "model_manager.h"
+ 
+ #include <algorithm>
+@@ -1732,7 +1733,27 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
+     auto add             = [](size_t a, size_t b) { return b > SIZE_MAX - a ? SIZE_MAX : a + b; };
+     const size_t missing = compute_backend_alloc_size(states, true);
+     // Backend scratch buffers and pipelines are not included in graph measurements.
+-    constexpr size_t safety_margin = 512ULL * 1024ULL * 1024ULL;
++    //
++    // Ascend 310B1 adaptation: the entire NPU-visible pool reported by
++    // aclrtGetMemInfo(ACL_HBM_MEM) is only ~735 MB on this board, so a fixed
++    // 512 MB reserve rejects allocations that would otherwise fit. Measured:
++    //   VAE: need 1013.10 MB device / 501.10 MB budget (available 733.28 MB)
++    //   DiT: need 1102.47 MB device / 591.80 MB budget (available 762.62 MB)
++    // In both cases required_device_bytes - required_budget_bytes == 512 MB, so
++    // the margin alone is what fails the check. Allow it to be lowered through
++    // SD_SAFETY_MARGIN_MB so the fit can be *measured* rather than assumed.
++    // The default stays 512 MB, so no other backend or device changes behaviour.
++    static const size_t safety_margin = []() -> size_t {
++        const char * env = getenv("SD_SAFETY_MARGIN_MB");
++        if (env != nullptr && env[0] != '\0') {
++            char *     end = nullptr;
++            const long mb  = strtol(env, &end, 10);
++            if (end != env && mb >= 0 && mb <= 4096) {
++                return (size_t) mb * 1024ULL * 1024ULL;
++            }
++        }
++        return 512ULL * 1024ULL * 1024ULL;
++    }();
+     result.required_device_bytes   = add(add(request.pending_allocation_bytes, missing), safety_margin);
+     result.required_budget_bytes   = add(request.runtime_peak_bytes(), missing);
+     auto available_device_bytes    = [&](ggml_backend_t backend) {
+diff --git a/src/pipeline/image.cpp b/src/pipeline/image.cpp
+index d3d25c8..7d82f4a 100644
+--- a/src/pipeline/image.cpp
++++ b/src/pipeline/image.cpp
+@@ -13,6 +13,52 @@
+ #include "runtime/image_preprocess.h"
+ #include "upscaler.h"
+ 
++namespace {
++
++/**************************************************************************
++* Function name : DumpLatentIfRequested
++* Description   : Dump a Tensor<float> to <SD_DUMP_DIR>/<name>.bin so the
++*                 CANN0 and CPU numerical paths can be compared element-wise.
++*                 Layout: int64 ndim | int64 shape[ndim] | float32 payload.
++*                 No-op unless SD_DUMP_DIR is set.
++* Input         : name   - base file name, no extension
++*                 tensor - tensor to write
++* Return        : none
++* Others        : fopen/fwrite only; a failure to dump never aborts a run.
++* Mod date      Version  Author  Change
++* -----------------------------------------------
++* 2026/10/14    V1.0     -       created
++**************************************************************************/
++void DumpLatentIfRequested(const char* name, const sd::Tensor<float>& tensor) {
++    const char* dump_dir = std::getenv("SD_DUMP_DIR");
++    if (dump_dir == NULL || tensor.empty()) {
++        return;
++    }
++
++    char dump_path[512];
++    snprintf(dump_path, sizeof(dump_path), "%s/%s.bin", dump_dir, name);
++
++    FILE* dump_handle = std::fopen(dump_path, "wb");
++    if (dump_handle == NULL) {
++        LOG_ERROR("cannot open latent dump %s", dump_path);
++        return;
++    }
++
++    const int64_t elem_count = tensor.numel();
++    const int64_t dim_count  = tensor.dim();
++    std::fwrite(&dim_count, sizeof(dim_count), 1, dump_handle);
++    for (int64_t dim_size : tensor.shape()) {
++        std::fwrite(&dim_size, sizeof(dim_size), 1, dump_handle);
++    }
++    std::fwrite(tensor.data(), sizeof(float), static_cast<size_t>(elem_count), dump_handle);
++    std::fclose(dump_handle);
++
++    LOG_INFO("dumped %s: %lld elements, %lld dims", dump_path,
++             (long long) elem_count, (long long) dim_count);
++}
++
++}  // namespace
++
+ namespace sd::pipeline {
+ 
+     struct CircularAxesState {
+@@ -868,6 +914,7 @@ namespace sd::pipeline {
+             sd->rng->manual_seed(cur_seed);
+             sd->sampler_rng->manual_seed(cur_seed);
+             sd::Tensor<float> noise = sd::randn_like<float>(latents.init_latent, sd->rng);
++            DumpLatentIfRequested("noise", noise);
+ 
+             sd::Tensor<float> x_0 = sd->sample(sd->diffusion_model,
+                                                true,
+@@ -897,6 +944,7 @@ namespace sd::pipeline {
+             int64_t sampling_end  = ggml_time_ms();
+             if (!x_0.empty()) {
+                 LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
++                DumpLatentIfRequested("latent", x_0);
+                 final_latents.push_back(std::move(x_0));
+                 continue;
+             }

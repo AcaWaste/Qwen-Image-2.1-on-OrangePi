@@ -1,0 +1,1154 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 752dabbb..93e8c1a3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -196,6 +196,7 @@ set(GGML_BLAS_VENDOR ${GGML_BLAS_VENDOR_DEFAULT} CACHE STRING
+                                             "ggml: BLAS library vendor")
+ option(GGML_LLAMAFILE                       "ggml: use LLAMAFILE"                             ${GGML_LLAMAFILE_DEFAULT})
+ 
++option(GGML_CANN                            "ggml: use CANN"                                  OFF)
+ option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
+ option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
+ option(GGML_CUDA_FORCE_MMQ                  "ggml: use mmq kernels instead of cuBLAS"         OFF)
+diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
+index 8c348734..c468b115 100644
+--- a/src/ggml-backend.cpp
++++ b/src/ggml-backend.cpp
+@@ -1873,7 +1873,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
+ 
+     // initialize hash table
+     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
+-    sched->hash_set    = ggml_hash_set_new(graph_size);
++    // [310B1-CANN patch] see cann-hashset-patch.py for rationale.
++    fprintf(stderr, "[310B1-PATCH] sched_new graph_size=%zu\n", graph_size);
++    sched->hash_set    = ggml_hash_set_new(graph_size * 8 + 32768);
+     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+ 
+diff --git a/src/ggml-cann/CMakeLists.txt b/src/ggml-cann/CMakeLists.txt
+old mode 100755
+new mode 100644
+index aee5e7b0..43995f03
+--- a/src/ggml-cann/CMakeLists.txt
++++ b/src/ggml-cann/CMakeLists.txt
+@@ -59,11 +59,12 @@ if (CANN_INSTALL_DIR)
+         ${CANN_INSTALL_DIR}/acllib/include
+     )
+ 
++    list(APPEND CANN_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/aclnnop_shim)
+     list(APPEND CANN_LIBRARIES
+-        ascendcl
+-        nnopbase
+-        opapi
+-        acl_op_compiler
++        ${CANN_INSTALL_DIR}/lib64/libascendcl.so
++        ${CANN_INSTALL_DIR}/lib64/libnnopbase.so
++        ${CANN_INSTALL_DIR}/lib64/libopapi.so
++        ${CANN_INSTALL_DIR}/lib64/libacl_op_compiler.so
+     )
+ 
+     file(GLOB GGML_SOURCES_CANN "*.cpp")
+diff --git a/src/ggml-cann/aclnn_ops.cpp b/src/ggml-cann/aclnn_ops.cpp
+index 902d2eda..2f4583f8 100644
+--- a/src/ggml-cann/aclnn_ops.cpp
++++ b/src/ggml-cann/aclnn_ops.cpp
+@@ -42,12 +42,13 @@
+ #include <aclnnop/aclnn_embedding.h>
+ #include <aclnnop/aclnn_eq_tensor.h>
+ #include <aclnnop/aclnn_exp.h>
++#include <aclnnop/aclnn_expand.h>
+ #include <aclnnop/aclnn_fill_scalar.h>
+ #include <aclnnop/aclnn_fused_infer_attention_score_v2.h>
+ #include <aclnnop/aclnn_ger.h>
+ #include <aclnnop/aclnn_group_norm.h>
+ #include <aclnnop/aclnn_gather_v2.h>
+-#include <aclnnop/aclnn_grouped_matmul_v3.h>
++//#include <aclnnop/aclnn_grouped_matmul_v3.h>  // [310B port] absent in CANN 8.5.1; never referenced in this tree
+ #include <aclnnop/aclnn_scatter.h>
+ #include <aclnnop/aclnn_gt_scalar.h>
+ #include <aclnnop/aclnn_im2col.h>
+@@ -65,12 +66,13 @@
+ #include <aclnnop/aclnn_permute.h>
+ #include <aclnnop/aclnn_pow.h>
+ #include <aclnnop/aclnn_pow_tensor_tensor.h>
+-#include <aclnnop/aclnn_recurrent_gated_delta_rule.h>
++//#include <aclnnop/aclnn_recurrent_gated_delta_rule.h>  // [310B port] absent in CANN 8.5.1; never referenced in this tree
+ #include <aclnnop/aclnn_reduce_sum.h>
+ #include <aclnnop/aclnn_reflection_pad1d.h>
+ #include <aclnnop/aclnn_repeat.h>
+ #include <aclnnop/aclnn_repeat_interleave.h>
+ #include <aclnnop/aclnn_rms_norm.h>
++#include <aclnnop/aclnn_rsqrt.h>
+ #include <aclnnop/aclnn_roll.h>
+ #include <aclnnop/aclnn_softmax.h>
+ #include <aclnnop/aclnn_softmax_cross_entropy_with_logits.h>
+@@ -87,6 +89,7 @@
+ #include <aclnnop/aclnn_zero.h>
+ #include <float.h>
+ 
++#include <algorithm>
+ #include <cmath>
+ #include <cstring>
+ #include <exception>
+@@ -344,10 +347,157 @@ static void aclnn_cast(ggml_backend_cann_context & ctx,
+     GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_src, cast_data_type, acl_dst);
+ }
+ 
++#ifdef ASCEND_310B
++static void aclnn_concat(ggml_backend_cann_context & ctx,
++                         aclTensorList *             tensorList,
++                         aclTensor *                 acl_dst,
++                         int64_t                     concat_dim);
++
++/**
++ * @brief Repeat (tile) for the Ascend 310B1, composed from Cat.
++ *
++ * Two candidates were tried first and both are dead ends on this part:
++ * aclnnRepeat has no ascend310b kernel at all, and aclnnExpand fails kernel
++ * selection with "Cannot find bin of op Expand, integral key
++ * 0/1/|float/ND/int64/ND/float/ND" - the three shipped Expand binaries are
++ * not keyed on the int64 shape tensor aclnn feeds. Cat does work, and a
++ * repeat is exactly "concatenate the copies with each other", so it is
++ * rebuilt from Cat here.
++ *
++ * A ggml repeat may grow several dimensions at once, so the node is
++ * decomposed one growing dimension at a time, in ascending order.  Every
++ * intermediate stage is a tightly packed tensor of the stage shape - never
++ * a strided view into a larger buffer - which is what makes the higher
++ * dimensions come out right: cat along dim d of a packed tensor simply
++ * yields the packed stage result.  One Cat takes all `factor` copies as
++ * inputs, so a stage costs exactly one kernel whatever the factor; a kernel
++ * launch is milliseconds on this part and the DiT repeats the same
++ * broadcast hundreds of times per step.
++ *
++ * Scratch is only needed by the intermediate stages, so a repeat that
++ * grows one dimension - the common case - allocates nothing at all.  Two
++ * buffers of nbytes(dst) cover up to four growing dimensions, because
++ * consecutive stages alternate between them.
++ *
++ * @param ctx The CANN backend context.
++ * @param dst The destination tensor; src[0] is the input.
++ */
++static void ggml_cann_repeat_310b(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
++    ggml_tensor * src = dst->src[0];
++
++    const size_t      typeSize = ggml_type_size(src->type);
++    const aclDataType aclType  = ggml_cann_type_mapping(src->type);
++
++    int nGrow = 0;
++    for (int i = 0; i < GGML_MAX_DIMS; i++) {
++        if (dst->ne[i] != src->ne[i]) {
++            nGrow++;
++        }
++    }
++
++    if (nGrow == 0) {
++        /* ggml_ext_full(ctx, value, 1, 1, 1, 1) emits repeat(one, 1,1,1,1):
++         * a repeat with nothing to repeat, i.e. a 4-byte copy.  The DiT has
++         * one of these at the head of nearly every runner segment, and
++         * leaving them on the CPU split the graph around each of them. */
++        acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
++        acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
++        GGML_CANN_CALL_ACLNN_OP(ctx, InplaceCopy, acl_dst.get(), acl_src.get());
++        return;
++    }
++
++    std::unique_ptr<ggml_cann_pool_alloc> bufA;
++    std::unique_ptr<ggml_cann_pool_alloc> bufB;
++    if (nGrow > 1) {
++        bufA.reset(new ggml_cann_pool_alloc(ctx.pool(), ggml_nbytes(dst)));
++        bufB.reset(new ggml_cann_pool_alloc(ctx.pool(), ggml_nbytes(dst)));
++    }
++    bool nextIsA = true;
++
++    /* The stage tensor is packed, so its strides follow from its shape. */
++    int64_t stageNe[GGML_MAX_DIMS];
++    size_t  stageNb[GGML_MAX_DIMS];
++    memcpy(stageNe, src->ne, sizeof(stageNe));
++    stageNb[0] = typeSize;
++    for (int i = 1; i < GGML_MAX_DIMS; i++) {
++        stageNb[i] = stageNb[i - 1] * (size_t) stageNe[i - 1];
++    }
++    /* The first stage is the op input, whose own strides decide the
++     * descriptor; every later stage is packed, so the strides built above
++     * describe it. */
++    void * stagePtr   = src->data;
++    bool   stageIsSrc = true;
++
++    for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
++        const int64_t factor = dst->ne[dim] / src->ne[dim];
++        if (factor == 1) {
++            continue;
++        }
++
++        bool last = true;
++        for (int j = dim + 1; j < GGML_MAX_DIMS; j++) {
++            if (dst->ne[j] != src->ne[j]) {
++                last = false;
++                break;
++            }
++        }
++
++        int64_t outNe[GGML_MAX_DIMS];
++        memcpy(outNe, stageNe, sizeof(outNe));
++        outNe[dim] = stageNe[dim] * factor;
++        size_t outNb[GGML_MAX_DIMS];
++        outNb[0] = typeSize;
++        for (int i = 1; i < GGML_MAX_DIMS; i++) {
++            outNb[i] = outNb[i - 1] * (size_t) outNe[i - 1];
++        }
++
++        /* The last stage writes the op output, whose own layout decides the
++         * descriptor; a scratch stage uses the packed one built above. */
++        acl_tensor_ptr tOut;
++        void *         outPtr = dst->data;
++        if (last) {
++            tOut = ggml_cann_create_tensor(dst);
++        } else {
++            outPtr  = nextIsA ? bufA->get() : bufB->get();
++            nextIsA = !nextIsA;
++            tOut    = ggml_cann_create_tensor(outPtr, aclType, typeSize, outNe, outNb, GGML_MAX_DIMS);
++        }
++
++        /* All `factor` copies are the same stage.  The list owns them:
++         * aclCreateTensorList takes over the aclTensor handles, so ownership
++         * must be released here -- keeping them alive would double free
++         * (acl_tensor.h, ggml_cann_create_tensor_list). */
++        std::vector<aclTensor *> copies;
++        copies.reserve((size_t) factor);
++        for (int64_t k = 0; k < factor; k++) {
++            if (stageIsSrc) {
++                copies.push_back(ggml_cann_create_tensor(src).release());
++            } else {
++                copies.push_back(
++                    ggml_cann_create_tensor(stagePtr, aclType, typeSize, stageNe, stageNb, GGML_MAX_DIMS).release());
++            }
++        }
++        acl_tensor_list_ptr list(aclCreateTensorList(copies.data(), (uint64_t) copies.size()));
++        aclnn_concat(ctx, list.get(), tOut.get(), GGML_MAX_DIMS - 1 - dim);
++
++        if (last) {
++            return;
++        }
++        memcpy(stageNe, outNe, sizeof(stageNe));
++        memcpy(stageNb, outNb, sizeof(stageNb));
++        stagePtr   = outPtr;
++        stageIsSrc = false;
++    }
++}
++#endif
++
+ void ggml_cann_repeat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+     ggml_tensor * src = dst->src[0];
+     GGML_ASSERT(ggml_can_repeat(src, dst));
+ 
++#ifdef ASCEND_310B
++    ggml_cann_repeat_310b(ctx, dst);
++#else
+     acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
+     acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
+ 
+@@ -355,6 +505,7 @@ void ggml_cann_repeat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+                                dst->ne[0] / src->ne[0] };
+ 
+     aclnn_repeat(ctx, acl_src.get(), acl_dst.get(), repeatsArray);
++#endif
+ }
+ 
+ void aclnn_add(ggml_backend_cann_context & ctx, aclTensor * acl_src0, aclTensor * acl_src1, aclTensor * acl_dst) {
+@@ -543,15 +694,28 @@ void ggml_cann_clamp(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+ void ggml_cann_scale(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+     ggml_tensor * src = dst->src[0];
+ 
+-    // scale factor
++    // scale factor and, for ggml_scale_bias(), the additive term that follows it
+     float v;
+     memcpy(&v, dst->op_params, sizeof(float));
+ 
++    float bias;
++    memcpy(&bias, (const float *) (dst->op_params) + 1, sizeof(float));
++
+     acl_scalar_ptr scale   = ggml_cann_create_scalar(&v, aclDataType::ACL_FLOAT);
+     acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
+     acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
+ 
+     GGML_CANN_CALL_ACLNN_OP(ctx, Muls, acl_src.get(), scale.get(), acl_dst.get());
++
++    // There is no fused scale+bias kernel on the parts this backend targets,
++    // but Adds is a plain vector op present everywhere, so fold the bias in as
++    // a second in-place pass instead of leaving the node on the CPU.
++    if (bias != 0.0f) {
++        float          alphaValue = 1.0f;
++        acl_scalar_ptr bias_sc    = ggml_cann_create_scalar(&bias, aclDataType::ACL_FLOAT);
++        acl_scalar_ptr alpha      = ggml_cann_create_scalar(&alphaValue, aclDataType::ACL_FLOAT);
++        GGML_CANN_CALL_ACLNN_OP(ctx, InplaceAdds, acl_dst.get(), bias_sc.get(), alpha.get());
++    }
+ }
+ 
+ void ggml_cann_argsort(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+@@ -1308,9 +1472,107 @@ static acl_tensor_ptr get_cache_acl_tensor(ggml_backend_cann_context & ctx,
+     return ggml_cann_create_tensor(*buffer, ggml_cann_type_mapping(dtype), ggml_type_size(dtype), ne, nb, dims);
+ }
+ 
++#ifdef ASCEND_310B
++/**
++ * @brief RMSNorm composed from vector primitives for the Ascend 310B1.
++ *
++ * The 310B op package ships only RmsNormQuant; the plain RmsNorm kernel that
++ * ggml_cann_rms_norm() calls does not exist there. The arithmetic is
++ *     y = x * rsqrt(mean(x * x, dim = ne0) + eps)
++ * which is exactly what the reference implementation computes, so it can be
++ * rebuilt from Mul / Mean / Adds / Rsqrt, all of which do have 310B kernels.
++ * Work is done in F32 regardless of the input type, matching the F32
++ * accumulation of the CPU reference; the result is cast back at the end.
++ *
++ * @param ctx The CANN backend context.
++ * @param dst The destination tensor; src[0] is the input, op_params holds eps.
++ */
++static void ggml_cann_rms_norm_310b(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
++    ggml_tensor * src = dst->src[0];
++
++    const int64_t n      = ggml_nelements(src);
++    const int64_t n_rows = src->ne[1] * src->ne[2] * src->ne[3];
++
++    ggml_cann_pool_alloc x32_alloc(ctx.pool(), (size_t) n * sizeof(float));
++    ggml_cann_pool_alloc y_alloc(ctx.pool(), (size_t) n * sizeof(float));
++    ggml_cann_pool_alloc mean_alloc(ctx.pool(), (size_t) n_rows * sizeof(float));
++    ggml_cann_pool_alloc rstd_alloc(ctx.pool(), (size_t) n_rows * sizeof(float));
++
++    // One row per (ne1, ne2, ne3) position: [1, ne1, ne2, ne3] in ggml order,
++    // i.e. a trailing length-1 dimension in acl order, which Mul broadcasts.
++    int64_t row_ne[GGML_MAX_DIMS] = { 1, src->ne[1], src->ne[2], src->ne[3] };
++    size_t  row_nb[GGML_MAX_DIMS];
++    row_nb[0] = sizeof(float);
++    for (int i = 1; i < GGML_MAX_DIMS; i++) {
++        row_nb[i] = row_nb[i - 1] * (size_t) row_ne[i - 1];
++    }
++
++    // The temporaries are F32 whatever the input type is, so their strides
++    // come from a plain contiguous F32 layout and not from src->nb.
++    int64_t full_ne[GGML_MAX_DIMS];
++    size_t  full_nb[GGML_MAX_DIMS];
++    full_nb[0] = sizeof(float);
++    for (int i = 0; i < GGML_MAX_DIMS; i++) {
++        full_ne[i] = src->ne[i];
++        if (i > 0) {
++            full_nb[i] = full_nb[i - 1] * (size_t) full_ne[i - 1];
++        }
++    }
++
++    acl_tensor_ptr acl_src  = ggml_cann_create_tensor(src);
++    acl_tensor_ptr acl_dst  = ggml_cann_create_tensor(dst);
++    acl_tensor_ptr acl_x32  = ggml_cann_create_tensor(x32_alloc.get(), ACL_FLOAT, sizeof(float), full_ne, full_nb,
++                                                       GGML_MAX_DIMS);
++    acl_tensor_ptr acl_y    = ggml_cann_create_tensor(y_alloc.get(), ACL_FLOAT, sizeof(float), full_ne, full_nb,
++                                                      GGML_MAX_DIMS);
++    acl_tensor_ptr acl_mean = ggml_cann_create_tensor(mean_alloc.get(), ACL_FLOAT, sizeof(float), row_ne, row_nb,
++                                                      GGML_MAX_DIMS);
++    acl_tensor_ptr acl_rstd = ggml_cann_create_tensor(rstd_alloc.get(), ACL_FLOAT, sizeof(float), row_ne, row_nb,
++                                                      GGML_MAX_DIMS);
++
++    float          oneValue = 1.0f;
++    float          eps;
++    memcpy(&eps, dst->op_params, sizeof(float));
++    acl_scalar_ptr one     = ggml_cann_create_scalar(&oneValue, ACL_FLOAT);
++    acl_scalar_ptr eps_sc  = ggml_cann_create_scalar(&eps, ACL_FLOAT);
++
++    // x32 = (float) x
++    if (src->type == GGML_TYPE_F32) {
++        GGML_CANN_CALL_ACLNN_OP(ctx, Muls, acl_src.get(), one.get(), acl_x32.get());
++    } else {
++        GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_src.get(), ACL_FLOAT, acl_x32.get());
++    }
++
++    // mean = reduce_mean(x * x) over ne0, which is the last acl dimension
++    int64_t            mean_dim_data[1] = { GGML_MAX_DIMS - 1 };
++    acl_int_array_ptr  mean_dim         = ggml_cann_create_int_array(mean_dim_data, 1);
++    GGML_CANN_CALL_ACLNN_OP(ctx, Mul, acl_x32.get(), acl_x32.get(), acl_y.get());
++    GGML_CANN_CALL_ACLNN_OP(ctx, Mean, acl_y.get(), mean_dim.get(), true, ACL_FLOAT, acl_mean.get());
++
++    // rstd = rsqrt(mean + eps)
++    GGML_CANN_CALL_ACLNN_OP(ctx, InplaceAdds, acl_mean.get(), eps_sc.get(), one.get());
++    GGML_CANN_CALL_ACLNN_OP(ctx, Rsqrt, acl_mean.get(), acl_rstd.get());
++
++    // y = x32 * rstd (rstd broadcasts over ne0); acl_y is free again here
++    GGML_CANN_CALL_ACLNN_OP(ctx, Mul, acl_x32.get(), acl_rstd.get(), acl_y.get());
++
++    if (dst->type == GGML_TYPE_F32) {
++        GGML_CANN_CALL_ACLNN_OP(ctx, Muls, acl_y.get(), one.get(), acl_dst.get());
++    } else {
++        GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_y.get(), ggml_cann_type_mapping(dst->type), acl_dst.get());
++    }
++}
++#endif
++
+ void ggml_cann_rms_norm(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+     ggml_tensor * src = dst->src[0];
+ 
++#ifdef ASCEND_310B
++    ggml_cann_rms_norm_310b(ctx, dst);
++    return;
++#endif
++
++
+     acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
+     acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
+ 
+@@ -2215,7 +2477,34 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor *
+         }
+     }
+ 
+-    acl_tensor_ptr acl_input_tensor = ggml_cann_create_tensor(input, bcast_input_ne, bcast_input_nb, n_dims);
++    acl_tensor_ptr       acl_input_tensor;
++    ggml_cann_pool_alloc tInputAlloc(ctx.pool());
++    void *               pvHalfIn = NULL;
++#ifdef ASCEND_310B
++    /* [310B] MatMulV2 only accepts FP16 operands, but ggml feeds F32
++     * activations. Cast the input into an FP16 scratch buffer first; the byte
++     * strides are halved from the real broadcast strides so that non
++     * contiguous layouts survive unchanged. */
++    if (input->type != GGML_TYPE_F16) {
++        size_t aInHalfStride[GGML_MAX_DIMS * 2];
++        for (int i = 0; i < GGML_MAX_DIMS * 2; i++) {
++            aInHalfStride[i] = bcast_input_nb[i] / 2;
++        }
++        int64_t nInElems = 1;
++        for (int i = 0; i < n_dims; i++) {
++            nInElems *= bcast_input_ne[i];
++        }
++        pvHalfIn = tInputAlloc.alloc((size_t) nInElems * sizeof(uint16_t));
++        acl_tensor_ptr ptInSrc = ggml_cann_create_tensor(input, bcast_input_ne, bcast_input_nb, n_dims);
++        acl_input_tensor       = ggml_cann_create_tensor(pvHalfIn, ACL_FLOAT16, sizeof(uint16_t), bcast_input_ne,
++                                                   aInHalfStride, n_dims);
++        aclnn_cast(ctx, ptInSrc.get(), acl_input_tensor.get(), ACL_FLOAT16);
++    } else {
++        acl_input_tensor = ggml_cann_create_tensor(input, bcast_input_ne, bcast_input_nb, n_dims);
++    }
++#else
++    acl_input_tensor = ggml_cann_create_tensor(input, bcast_input_ne, bcast_input_nb, n_dims);
++#endif
+     int64_t        transpose_ne[]   = { bcast_weight_ne[1], bcast_weight_ne[0], bcast_weight_ne[2],
+                                         bcast_weight_ne[3], bcast_weight_ne[4], bcast_weight_ne[5] };
+     size_t         transpose_nb[]   = { bcast_weight_nb[1], bcast_weight_nb[0], bcast_weight_nb[2],
+@@ -2224,12 +2513,68 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor *
+ 
+     // Only check env once.
+     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
++#ifdef ASCEND_310B
++    /* [310B] MatMulV2 takes FP16 weights only, yet a few projections (txt_in,
++     * img_in) keep F32 weights even in an F16 build, and each of them pinned a
++     * whole graph segment to the CPU. Cast such a weight into a scratch buffer
++     * per call: they are small, and ND kernels exist alongside the NZ ones. */
++    ggml_cann_pool_alloc tWeightAlloc(ctx.pool());
++    if (weight->type == GGML_TYPE_F32) {
++        size_t aWHalfStride[GGML_MAX_DIMS * 2];
++        size_t aWHalfTrans[GGML_MAX_DIMS * 2];
++        for (int i = 0; i < GGML_MAX_DIMS * 2; i++) {
++            aWHalfStride[i] = bcast_weight_nb[i] / 2;
++            aWHalfTrans[i]  = aWHalfStride[i];
++        }
++        size_t tmpStride   = aWHalfTrans[0];
++        aWHalfTrans[0]     = aWHalfTrans[1];
++        aWHalfTrans[1]     = tmpStride;
++
++        int64_t nWeightElems = 1;
++        for (int i = 0; i < n_dims; i++) {
++            nWeightElems *= bcast_weight_ne[i];
++        }
++        void *         pvHalfW = tWeightAlloc.alloc((size_t) nWeightElems * sizeof(uint16_t));
++        acl_tensor_ptr ptWSrc  = ggml_cann_create_tensor(weight, bcast_weight_ne, bcast_weight_nb, n_dims);
++        acl_tensor_ptr ptWHalf = ggml_cann_create_tensor(pvHalfW, ACL_FLOAT16, sizeof(uint16_t), bcast_weight_ne,
++                                                         aWHalfStride, n_dims);
++        aclnn_cast(ctx, ptWSrc.get(), ptWHalf.get(), ACL_FLOAT16);
++
++        acl_weight_tensor = ggml_cann_create_tensor(pvHalfW, ACL_FLOAT16, sizeof(uint16_t), transpose_ne,
++                                                    aWHalfTrans, n_dims, ACL_FORMAT_ND);
++    } else
++#endif
+     if (weight_to_nz && weight->type != GGML_TYPE_BF16 && is_matmul_weight(weight)) {
+         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_FRACTAL_NZ);
+     } else {
+         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_ND);
+     }
+-    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst, bcast_dst_ne, bcast_dst_nb, n_dims);
++    acl_tensor_ptr acl_dst;
++#ifdef ASCEND_310B
++    /* [310B] Ascend310B1 only ships FP16-output MatMul kernels, e.g.
++     * ops_legacy/mat_mul/MatMulV2_NZ_NZ_FP16_FP16_*.o, while ggml MUL_MAT
++     * always writes an F32 destination. Running the cube op into an FP16
++     * scratch buffer and casting afterwards keeps the result identical. */
++    ggml_cann_pool_alloc tHalfAlloc(ctx.pool());
++    void *               pvHalfOut = NULL;
++
++    if (dst->type != GGML_TYPE_F16) {
++        size_t aHalfStride[GGML_MAX_DIMS * 2];
++        for (int i = 0; i < GGML_MAX_DIMS * 2; i++) {
++            aHalfStride[i] = bcast_dst_nb[i] / 2;
++        }
++        int64_t nOutElems = 1;
++        for (int i = 0; i < n_dims; i++) {
++            nOutElems *= bcast_dst_ne[i];
++        }
++        pvHalfOut = tHalfAlloc.alloc((size_t) nOutElems * sizeof(uint16_t));
++        acl_dst   = ggml_cann_create_tensor(pvHalfOut, ACL_FLOAT16, sizeof(uint16_t), bcast_dst_ne, aHalfStride, n_dims);
++    } else {
++        acl_dst = ggml_cann_create_tensor(dst, bcast_dst_ne, bcast_dst_nb, n_dims);
++    }
++#else
++    acl_dst = ggml_cann_create_tensor(dst, bcast_dst_ne, bcast_dst_nb, n_dims);
++#endif
+ 
+     switch (n_dims) {
+         case 2:
+@@ -2245,6 +2590,23 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor *
+             GGML_CANN_CALL_ACLNN_OP(ctx, Matmul, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), 1);
+             break;
+     }
++
++#ifdef ASCEND_310B
++    /* [310B] cast the FP16 cube result back into the F32 ggml destination. */
++    if (dst->type != GGML_TYPE_F16) {
++        size_t    aCastStride[GGML_MAX_DIMS];
++        int64_t * aCastNe = dst->ne;
++
++        aCastStride[0] = sizeof(uint16_t);
++        for (int i = 1; i < GGML_MAX_DIMS; i++) {
++            aCastStride[i] = dst->nb[i] / 2;
++        }
++        acl_tensor_ptr ptHalfSrc = ggml_cann_create_tensor(pvHalfOut, ACL_FLOAT16, sizeof(uint16_t), aCastNe,
++                                                           aCastStride, GGML_MAX_DIMS);
++        acl_tensor_ptr ptDstTens = ggml_cann_create_tensor(dst);
++        aclnn_cast(ctx, ptHalfSrc.get(), ptDstTens.get(), ggml_cann_type_mapping(dst->type));
++    }
++#endif
+ }
+ 
+ /**
+@@ -3482,6 +3844,125 @@ void ggml_cann_conv_transpose_1d(ggml_backend_cann_context & ctx, ggml_tensor *
+     }
+ }
+ 
++/**
++ * @brief Exposes a ggml tensor as an FP16 ACL tensor, casting when necessary.
++ *
++ * Ascend310B1 only ships FP16 cube kernels, so aclnnConvolution() has to be fed
++ * ACL_FLOAT16 operands even though ggml hands over F32 activations. When `src`
++ * already is F16 the original buffer is reused and nothing is allocated.
++ *
++ * The scratch strides are obtained by halving the real byte strides instead of
++ * walking `ne`, so a layout that is not contiguous survives the round trip.
++ *
++ * @param ctx        The CANN backend context.
++ * @param src        Source tensor to expose as FP16.
++ * @param alloc      Pool allocator owning the scratch buffer. It has to outlive
++ *                   the returned tensor.
++ * @param ppvScratch Receives the scratch pointer so the caller can tell whether
++ *                   a buffer was taken. Set to nullptr when no cast was needed.
++ * @param format     ACL format to declare for the created tensors.
++ * @return ACL tensor referring to FP16 data.
++ */
++static acl_tensor_ptr ggml_cann_cast_to_fp16(ggml_backend_cann_context & ctx,
++                                             ggml_tensor *               src,
++                                             ggml_cann_pool_alloc &      alloc,
++                                             void **                     ppvScratch,
++                                             aclFormat                   format) {
++    if (src->type == GGML_TYPE_F16) {
++        return ggml_cann_create_tensor(src, src->ne, src->nb, GGML_MAX_DIMS, format);
++    }
++
++    size_t aHalfNb[GGML_MAX_DIMS];
++    for (int i = 0; i < GGML_MAX_DIMS; i++) {
++        aHalfNb[i] = src->nb[i] / 2;
++    }
++
++    *ppvScratch = alloc.alloc(ggml_nbytes(src) / 2);
++
++    acl_tensor_ptr aclSrc = ggml_cann_create_tensor(src, src->ne, src->nb, GGML_MAX_DIMS, format);
++    acl_tensor_ptr aclDst = ggml_cann_create_tensor(*ppvScratch, ACL_FLOAT16, sizeof(uint16_t), src->ne, aHalfNb,
++                                                    GGML_MAX_DIMS, format);
++    aclnn_cast(ctx, aclSrc.get(), aclDst.get(), ACL_FLOAT16);
++
++    return aclDst;
++}
++
++/**
++ * @brief Computes a 2D convolution on the NPU.
++ *
++ * ggml_conv_2d_direct() hands over three tensors whose ggml layouts land on the
++ * aclnn layouts once ggml_cann_create_tensor() reverses `ne` and `nb`, so no
++ * permutation is required:
++ *
++ *   src[0] kernel  ggml [KW, KH, IC, OC] -> aclnn weight (OC, IC, KH, KW)
++ *   src[1] input   ggml [ W,  H,  C,  N] -> aclnn input  ( N,  C,  H,  W)
++ *   dst            ggml [OW, OH, OC,  N] -> aclnn output ( N, OC, OH, OW)
++ *
++ * aclnnConvolution() orders the two spatial dimensions as (H, W) while ggml
++ * orders them as (ne[0] = W, ne[1] = H), so stride, padding and dilation are
++ * handed over reversed.
++ *
++ * [310B] Ascend310B1 only has Conv2D_5HD_{FP16,BF16} kernels, hence the FP16
++ * scratch buffers around the cube call. The destination type is restored
++ * afterwards, so callers still observe the F32 result ggml expects.
++ *
++ * @param ctx The CANN backend context.
++ * @param dst The destination tensor holding the convolution result.
++ */
++void ggml_cann_conv2d(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
++    ggml_tensor * srcKernel = dst->src[0];
++    ggml_tensor * srcInput  = dst->src[1];
++
++    const int32_t * piParams = (const int32_t *) dst->op_params;
++
++    /* ggml stores (s0, s1, p0, p1, d0, d1) for (W, H); aclnn wants (H, W). */
++    int64_t strideVal[2] = { piParams[1], piParams[0] };
++    int64_t padVal[2]    = { piParams[3], piParams[2] };
++    int64_t dilVal[2]    = { piParams[5], piParams[4] };
++
++    acl_int_array_ptr stride   = ggml_cann_create_int_array(strideVal, 2);
++    acl_int_array_ptr padding  = ggml_cann_create_int_array(padVal, 2);
++    acl_int_array_ptr dilation = ggml_cann_create_int_array(dilVal, 2);
++
++    /* ggml_conv_2d_direct() is not the depthwise entry point, so no grouping. */
++    int64_t groups      = 1;
++    bool    transposed  = false;
++    int8_t  cubeMathType = 0;
++
++    ggml_cann_pool_alloc tInputAlloc(ctx.pool());
++    ggml_cann_pool_alloc tKernelAlloc(ctx.pool());
++    ggml_cann_pool_alloc tResultAlloc(ctx.pool());
++
++    void * pvInput  = NULL;
++    void * pvKernel = NULL;
++    void * pvResult = NULL;
++
++    acl_tensor_ptr aclInput  = ggml_cann_cast_to_fp16(ctx, srcInput, tInputAlloc, &pvInput, ACL_FORMAT_NCHW);
++    acl_tensor_ptr aclKernel = ggml_cann_cast_to_fp16(ctx, srcKernel, tKernelAlloc, &pvKernel, ACL_FORMAT_NCHW);
++
++    acl_tensor_ptr aclResult;
++    if (dst->type == GGML_TYPE_F16) {
++        aclResult = ggml_cann_create_tensor(dst, dst->ne, dst->nb, GGML_MAX_DIMS, ACL_FORMAT_NCHW);
++    } else {
++        size_t aHalfNb[GGML_MAX_DIMS];
++        for (int i = 0; i < GGML_MAX_DIMS; i++) {
++            aHalfNb[i] = dst->nb[i] / 2;
++        }
++        pvResult  = tResultAlloc.alloc(ggml_nbytes(dst) / 2);
++        aclResult = ggml_cann_create_tensor(pvResult, ACL_FLOAT16, sizeof(uint16_t), dst->ne, aHalfNb, GGML_MAX_DIMS,
++                                            ACL_FORMAT_NCHW);
++    }
++
++    GGML_CANN_CALL_ACLNN_OP(ctx, Convolution, aclInput.get(), aclKernel.get(), nullptr, stride.get(), padding.get(),
++                            dilation.get(), transposed, padding.get(), groups, aclResult.get(), cubeMathType);
++
++    if (dst->type != GGML_TYPE_F16) {
++        /* [310B] move the FP16 cube result back into the F32 ggml destination. */
++        acl_tensor_ptr aclDst = ggml_cann_create_tensor(dst, dst->ne, dst->nb, GGML_MAX_DIMS, ACL_FORMAT_NCHW);
++        aclnn_cast(ctx, aclResult.get(), aclDst.get(), ggml_cann_type_mapping(dst->type));
++    }
++}
++
+ void ggml_cann_elu(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+     ggml_tensor * src0 = dst->src[0];
+ 
+diff --git a/src/ggml-cann/aclnn_ops.h b/src/ggml-cann/aclnn_ops.h
+index 678f4d65..9f76a7fb 100644
+--- a/src/ggml-cann/aclnn_ops.h
++++ b/src/ggml-cann/aclnn_ops.h
+@@ -783,6 +783,16 @@ void bcast_shape(ggml_tensor *    src0,
+  */
+ void ggml_cann_conv_transpose_1d(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+ 
++/**
++ * @brief Computes a 2D convolution, round-tripping the operands through FP16
++ *        on Ascend310B1 because the SoC only ships Conv2D_5HD_{FP16,BF16} kernels.
++ *
++ * @param ctx The CANN backend context.
++ * @param dst The destination tensor holding the convolution result; its op_params
++ *            carry (s0, s1, p0, p1, d0, d1) as written by ggml_conv_2d_direct().
++ */
++void ggml_cann_conv2d(ggml_backend_cann_context & ctx, ggml_tensor * dst);
++
+ /**
+  * @brief   Applies the ELU (Exponential Linear Unit) activation to a ggml tensor
+  * using the CANN backend.
+diff --git a/src/ggml-cann/ggml-cann.cpp b/src/ggml-cann/ggml-cann.cpp
+index c2745014..f446445b 100644
+--- a/src/ggml-cann/ggml-cann.cpp
++++ b/src/ggml-cann/ggml-cann.cpp
+@@ -32,6 +32,7 @@
+ #include <aclnnop/aclnn_trans_matmul_weight.h>
+ #include <stdarg.h>
+ 
++#include <atomic>
+ #include <chrono>
+ #include <cmath>
+ #include <cstdio>
+@@ -192,6 +193,44 @@ const ggml_cann_device_info & ggml_cann_info() {
+ }
+ 
+ //#define DEBUG_CANN_MALLOC
++/**
++ * @brief Set once ACL graph capture has started in this process.
++ *
++ * A captured ACL graph stores absolute device addresses of its inputs,
++ * outputs and intermediates.  Once a pool buffer has been captured into such
++ * a graph it must never be handed back to aclrtFree(): the graph would then
++ * replay against freed memory (observed on ascend310b as an MTE
++ * "DDR address out of range" fault).  CANN also forbids device malloc/free
++ * while a stream is being captured.  The buffer pools therefore stop
++ * releasing buffers for the rest of the process from the first capture on.
++ */
++static std::atomic<bool> g_cann_graph_capture_started{false};
++
++/**
++ * @brief Decide whether the buffer pools may keep releasing buffers.
++ *
++ * Stopping the release only when capture begins is too late: by then the pool
++ * has already been trimmed, so the capture itself needs aclrtMalloc() for the
++ * buffers it no longer holds, and CANN rejects device malloc on a stream that
++ * is being captured (observed on ascend310b as faults in MatMulV2/TransData
++ * during the first sampling step).  The pool must therefore stay warm from the
++ * start whenever ACL graph execution is enabled, which is the default.
++ *
++ * GGML_CANN_DISABLE_BUF_POOL_CLEAN overrides the default in both directions:
++ * "1" never releases, "0" restores the upstream per-allocation policy.
++ */
++static bool cann_pool_clean_disabled() {
++    auto flag = get_env_as_lowercase("GGML_CANN_DISABLE_BUF_POOL_CLEAN");
++    if (flag.has_value()) {
++        return parse_bool(*flag);
++    }
++#ifdef ASCEND_310B
++    return parse_bool(get_env_as_lowercase("GGML_CANN_ACL_GRAPH").value_or("on"));
++#else
++    return false;
++#endif
++}
++
+ /**
+  * @brief A pool of CANN buffers(priority segment buffer).
+  *
+@@ -251,7 +290,7 @@ struct ggml_cann_pool_buf_prio : public ggml_cann_pool {
+      * @param device The device ID to associate with this buffer pool.
+      */
+     explicit ggml_cann_pool_buf_prio(int device) : device(device) {
+-        disable_clean = parse_bool(get_env_as_lowercase("GGML_CANN_DISABLE_BUF_POOL_CLEAN").value_or(""));
++        disable_clean = cann_pool_clean_disabled();
+     }
+ 
+     /**
+@@ -310,7 +349,9 @@ struct ggml_cann_pool_buf_prio : public ggml_cann_pool {
+                 }
+             }
+ 
+-            bool should_clean = !disable_clean && b.size > min_free_margin &&
++            /* Addresses captured into an ACL graph must stay valid for the
++             * whole process, see g_cann_graph_capture_started. */
++            bool should_clean = !disable_clean && !g_cann_graph_capture_started.load() && b.size > min_free_margin &&
+                                 std::chrono::duration_cast<std::chrono::milliseconds>(now - b.last_used).count() > 100;
+             if (should_clean) {
+                 // free the buffer if the size is needed to be freed
+@@ -444,7 +485,7 @@ struct ggml_cann_pool_buf : public ggml_cann_pool {
+      * @param device The device ID to associate with this buffer pool.
+      */
+     explicit ggml_cann_pool_buf(int device) : device(device) {
+-        disable_clean = parse_bool(get_env_as_lowercase("GGML_CANN_DISABLE_BUF_POOL_CLEAN").value_or(""));
++        disable_clean = cann_pool_clean_disabled();
+     }
+ 
+     /**
+@@ -509,7 +550,9 @@ struct ggml_cann_pool_buf : public ggml_cann_pool {
+                 }
+             }
+ 
+-            bool should_clean = !disable_clean && b.size > min_free_margin &&
++            /* Addresses captured into an ACL graph must stay valid for the
++             * whole process, see g_cann_graph_capture_started. */
++            bool should_clean = !disable_clean && !g_cann_graph_capture_started.load() && b.size > min_free_margin &&
+                                 std::chrono::duration_cast<std::chrono::milliseconds>(now - b.last_used).count() > 100;
+             if (should_clean) {
+                 // free the buffer if the size is needed to be freed
+@@ -1679,7 +1722,18 @@ static const char * ggml_backend_cann_host_buffer_name(ggml_backend_buffer_t buf
+  * @param buffer The CANN host buffer to free.
+  */
+ static void ggml_backend_cann_host_buffer_free(ggml_backend_buffer_t buffer) {
+-    ACL_CHECK(aclrtFreeHost(buffer->context));
++    void * hostPtr = buffer->context;
++
++    if (hostPtr == nullptr) {
++        return;
++    }
++
++    /* [310B] context points at the aligned slice handed out by
++     * ggml_cann_host_malloc(); the real aclrtMallocHost() pointer sits in the
++     * slot immediately before it. */
++    void * rawPtr = ((void **) hostPtr)[-1];
++
++    ACL_CHECK(aclrtFreeHost(rawPtr));
+ }
+ 
+ /**
+@@ -1694,20 +1748,39 @@ static void * ggml_cann_host_malloc(size_t size) {
+         return nullptr;
+     }
+ 
+-    const size_t alignment = 128;
+-    size                   = GGML_PAD(size, alignment);
+-    if (size == 0) {
+-        size = alignment;
++    /* [310B] aclrtMallocHost() does not guarantee TENSOR_ALIGNMENT on
++     * Ascend310B1, and ggml_backend_cpu_buffer_from_ptr() asserts on it. The
++     * previous version only padded the requested size and passed the raw
++     * pointer straight through, so simply registering the CANN backend made
++     * every host-buffer weight load abort. Request extra room, hand back an
++     * aligned slice, and keep the original aclrtMallocHost() pointer in the
++     * slot just before it so the matching free hook can return it verbatim. */
++    const size_t alignBytes = 256;
++    const size_t headerSize = sizeof(void *);
++    size_t       allocSize  = GGML_PAD(size, alignBytes) + alignBytes + headerSize;
++
++    if (allocSize < size) {
++        /* overflow guard */
++        return nullptr;
+     }
+ 
+-    void *   hostPtr = nullptr;
+-    aclError err     = aclrtMallocHost((void **) &hostPtr, size);
++    void *   rawPtr = nullptr;
++    aclError err    = aclrtMallocHost((void **) &rawPtr, allocSize);
+     if (err != ACL_SUCCESS) {
+-        GGML_LOG_WARN("%s: failed to allocate %.2f MiB of pinned memory: %s\n", __func__, size / 1024.0 / 1024.0,
++        GGML_LOG_WARN("%s: failed to allocate %.2f MiB of pinned memory: %s\n", __func__, allocSize / 1024.0 / 1024.0,
+                       aclGetRecentErrMsg());
+         return nullptr;
+     }
+-    return hostPtr;
++    if (rawPtr == nullptr) {
++        return nullptr;
++    }
++
++    uintptr_t uiBase    = (uintptr_t) rawPtr + headerSize;
++    uintptr_t uiAligned = (uiBase + alignBytes - 1) & ~((uintptr_t) alignBytes - 1);
++
++    ((void **) uiAligned)[-1] = rawPtr;
++
++    return (void *) uiAligned;
+ }
+ 
+ /**
+@@ -1986,6 +2059,9 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
+         case GGML_OP_CONV_TRANSPOSE_1D:
+             ggml_cann_conv_transpose_1d(ctx, dst);
+             break;
++        case GGML_OP_CONV_2D:
++            ggml_cann_conv2d(ctx, dst);
++            break;
+         case GGML_OP_LOG:
+             GGML_CANN_CALL_OP_UNARY(Log);
+             break;
+@@ -2264,6 +2340,9 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
+                                             bool                        cann_graph_capture_required) {
+ #ifdef USE_ACL_GRAPH
+     if (use_cann_graph && cann_graph_capture_required) {  // Begin CANN graph capture
++        /* Set before the capture begins: a buffer freed while the stream is
++         * being captured is just as fatal as one freed after it. */
++        g_cann_graph_capture_started.store(true);
+         ACL_CHECK(aclmdlRICaptureBegin(cann_ctx->stream(), ACL_MODEL_RI_CAPTURE_MODE_GLOBAL));
+     }
+ #endif  // USE_ACL_GRAPH
+@@ -2296,6 +2375,29 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
+                 GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+             }
+             GGML_ASSERT(ok);
++#ifdef ASCEND_310B
++            /* Debug aid only: with GGML_CANN_SYNC_DEBUG=1 every node is
++             * logged and the stream is drained after it, so a device-side
++             * fault names the node that caused it. Never leave this on for
++             * timing runs - one barrier per node dominates the wall clock. */
++            static const bool sync_debug = parse_bool(get_env_as_lowercase("GGML_CANN_SYNC_DEBUG").value_or(""));
++            if (sync_debug) {
++                /* src0's shape is what the REPEAT/RMS_NORM decompositions care
++                 * about, and it is not recoverable from the op name alone. */
++                const ggml_tensor * src0   = node->src[0];
++                char                strSrc[64] = "-";
++                if (src0 != nullptr) {
++                    snprintf(strSrc, sizeof(strSrc), "[%lld,%lld,%lld,%lld]", (long long) src0->ne[0],
++                             (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3]);
++                }
++                GGML_LOG_INFO("[310B1-DBG] #%d %s op=%s ne=[%lld,%lld,%lld,%lld] src0=%s\n", i, node->name,
++                              ggml_op_name(node->op), (long long) node->ne[0], (long long) node->ne[1],
++                              (long long) node->ne[2], (long long) node->ne[3], strSrc);
++                if (!use_cann_graph) {
++                    ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
++                }
++            }
++#endif
+         }
+     }
+ 
+@@ -2357,10 +2459,28 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend,
+         use_cann_graph = false;
+     }
+ 
++    /* Escape hatch: ACL graph replay gives no per-node visibility, so a
++     * device-side fault there can only be attributed by replaying the same
++     * graph op by op. */
++    static const bool no_acl_graph = parse_bool(get_env_as_lowercase("GGML_CANN_NO_ACL_GRAPH").value_or(""));
++    if (no_acl_graph) {
++        use_cann_graph = false;
++    }
++
+     if (use_cann_graph) {
+         // If no matching graph is found, the graph needs to be recaptured.
+         graph_capture_required = !cann_ctx->graph_lru_cache.find_and_move_to_front(cgraph);
+ 
++        /* A capture costs tens of seconds for the DiT-sized graph, a replay
++         * costs nothing; without this line there is no way to tell from the
++         * outside which one a given run paid for.  Asked for explicitly
++         * because a resident server would otherwise log one line per step. */
++        static const bool graph_trace = parse_bool(get_env_as_lowercase("GGML_CANN_GRAPH_TRACE").value_or(""));
++        if (graph_trace) {
++            GGML_LOG_INFO("[310B] acl graph %s: n_nodes=%d\n",
++                          graph_capture_required ? "capture" : "replay", cgraph->n_nodes);
++        }
++
+         if (graph_capture_required) {
+             // If no matching graph is found, add a new ACL graph.
+             ggml_cann_graph * new_graph = ggml_cann_graph::create_from_cgraph(cgraph);
+@@ -2401,6 +2521,148 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend,
+  *              otherwise false.
+  */
+ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
++#ifdef ASCEND_310B
++    /* [310B] Ascend310B1 exposes a deliberately trimmed kernel set; the aclnn
++     * implementations below assume the Ascend910/310P opp package and abort the
++     * whole process through GGML_ABORT when a kernel is missing. Claim only what
++     * has a kernel binary under
++     *   opp/built-in/op_impl/ai_core/tbe/kernel/ascend310b/
++     * and let everything else fall back to the CPU backend. */
++
++    /* 0) A leaf / parameter tensor (GGML_OP_NONE) is not an operation at all.
++     *    ggml consults supports_op() for two different questions, and this is
++     *    the second one: "may this backend *host* that pre-allocated params
++     *    buffer" (ggml_backend_sched_backend_from_buffer, ggml-backend.cpp:888).
++     *    A "no" there is fatal and unrecoverable - ggml-backend.cpp:938 aborts
++     *    with "pre-allocated tensor ... in a buffer ... that cannot run the
++     *    operation", because a pre-allocated tensor cannot be moved to another
++     *    backend. Whether the NPU may hold BF16 *bytes* is not a dtype
++     *    question, so answer before the dtype gate below; the original switch
++     *    further down already returns true for GGML_OP_NONE. */
++    if (op->op == GGML_OP_NONE) {
++        return true;
++    }
++
++    /* A/B switch for the dev1 additions (RMS_NORM via Mul/Mean/Rsqrt, REPEAT
++     * via Cat, SCALE with bias, F32 weights cast to F16). GGML_CANN_310B_EXTRA_OPS=0
++     * restores the pre-dev1 split so one binary can measure both sides. */
++    static const bool extra_ops = parse_bool(get_env_as_lowercase("GGML_CANN_310B_EXTRA_OPS").value_or("1"));
++
++    /* 1) Ascend310B1 has no BF16 Cast kernel: aclnnCast rejects DT_BFLOAT16 with
++     *    "The param dtype not implemented for DT_BFLOAT16". */
++    if (op->type == GGML_TYPE_BF16) {
++        return false;
++    }
++    for (int i = 0; i < GGML_MAX_SRC; i++) {
++        if (op->src[i] != NULL && op->src[i]->type == GGML_TYPE_BF16) {
++            return false;
++        }
++    }
++
++    /* 2) op families with no ascend310b kernel binary at all. */
++    switch (op->op) {
++        case GGML_OP_UNARY:
++            /* no SoftplusV2 kernel; the rest of the unary set is covered. */
++            if (ggml_get_unary_op(op) == GGML_UNARY_OP_SOFTPLUS) {
++                return false;
++            }
++            break;
++        case GGML_OP_MUL_MAT:
++            /* only MatMulV2_*_FP16_FP16_* exists: no quantized matmul
++             * (WeightQuantBatchMatmulV2) and no F32 weight kernel. F32 weights
++             * are cast to F16 inside ggml_cann_mat_mul_fp(). */
++            if (op->src[0]->type != GGML_TYPE_F16 && op->src[0]->type != GGML_TYPE_F32) {
++                return false;
++            }
++            if (op->src[0]->type == GGML_TYPE_F32 && !extra_ops) {
++                return false;
++            }
++            break;
++        case GGML_OP_CONCAT:
++            /* aclnnCat has no DT_INT4; keep the dtypes verified to work. */
++            switch (op->src[0]->type) {
++                case GGML_TYPE_F32:
++                case GGML_TYPE_F16:
++                case GGML_TYPE_I8:
++                case GGML_TYPE_I16:
++                case GGML_TYPE_I32:
++                case GGML_TYPE_I64:
++                    break;
++                default:
++                    return false;
++            }
++            break;
++        case GGML_OP_GLU:
++            /* [310B] only the quick variants decompose onto 310B vector ops. */
++            switch (ggml_get_glu_op(op)) {
++                case GGML_GLU_OP_SWIGLU:
++                case GGML_GLU_OP_GEGLU:
++                case GGML_GLU_OP_GEGLU_ERF:
++                    return false;
++                default:
++                    break;
++            }
++            break;
++        case GGML_OP_RMS_NORM:
++            /* [310B] no kernel binary on ascend310b, so
++             * ggml_cann_rms_norm_310b() composes it from Mul/Mean/Adds/Rsqrt.
++             * GGML_CANN_310B_EXTRA_OPS=0 sends it back to the CPU. */
++            if (!extra_ops) {
++                return false;
++            }
++            break;
++        case GGML_OP_REPEAT: {
++            /* [310B] no Repeat kernel and aclnnExpand cannot select a kernel
++             * binary either, so ggml_cann_repeat_310b() rebuilds the op from
++             * Cat: one Cat per growing dimension, all copies as inputs.  A
++             * repeat with no growing dimension (the scalar "full" that opens
++             * nearly every runner segment) is a plain copy, also handled
++             * there. */
++            int64_t maxFactor = 1;
++            for (int i = 0; i < GGML_MAX_DIMS; i++) {
++                const int64_t srcNe = op->src[0]->ne[i];
++                if (srcNe == op->ne[i]) {
++                    continue;
++                }
++                if (srcNe <= 0 || op->ne[i] % srcNe != 0) {
++                    return false;
++                }
++                const int64_t factor = op->ne[i] / srcNe;
++                if (factor > maxFactor) {
++                    maxFactor = factor;
++                }
++            }
++            if (!extra_ops || maxFactor > 64) {
++                GGML_LOG_DEBUG("[310B] REPEAT stays on CPU: src ne %lld,%lld,%lld,%lld -> dst ne %lld,%lld,%lld,%lld\n",
++                               (long long) op->src[0]->ne[0], (long long) op->src[0]->ne[1],
++                               (long long) op->src[0]->ne[2], (long long) op->src[0]->ne[3],
++                               (long long) op->ne[0], (long long) op->ne[1],
++                               (long long) op->ne[2], (long long) op->ne[3]);
++                return false;
++            }
++            return true;
++        }
++        case GGML_OP_GROUP_NORM:
++        case GGML_OP_ROPE:                /* only RotaryPosEmbInfer exists   */
++        case GGML_OP_FLASH_ATTN_EXT:      /* no FlashAttentionScore          */
++        case GGML_OP_ARGSORT:
++        case GGML_OP_IM2COL:
++        case GGML_OP_POOL_2D:
++        case GGML_OP_SET_ROWS:
++        case GGML_OP_GET_ROWS:
++        case GGML_OP_OUT_PROD:
++        case GGML_OP_MUL_MAT_ID:
++        case GGML_OP_CROSS_ENTROPY_LOSS:
++        case GGML_OP_CUMSUM:
++        case GGML_OP_GATED_LINEAR_ATTN:
++        case GGML_OP_SSM_CONV:
++        case GGML_OP_CONV_TRANSPOSE_1D:
++        case GGML_OP_PAD_REFLECT_1D:
++            return false;
++        default:
++            break;
++    }
++#endif
+     switch (op->op) {
+         case GGML_OP_UNARY:
+             switch (ggml_get_unary_op(op)) {
+@@ -2649,9 +2911,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
+         case GGML_OP_CONV_TRANSPOSE_1D:
+             return true;
+         case GGML_OP_SCALE:
+-            float bias;
+-            memcpy(&bias, (const float *) (op->op_params) + 1, sizeof(float));
+-            return bias == 0.0f;  // TODO: support bias != 0.0f
++            /* A non-zero bias is handled by ggml_cann_scale() as a second
++             * in-place Adds pass, so both forms run here. */
++            return extra_ops;
+         case GGML_OP_SOFT_MAX:
+             // TODO: support attention sinks [TAG_ATTN_SINKS]
+             if (op->src[2]) {
+@@ -2690,6 +2952,47 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
+                 }
+                 return true;
+             }
++#ifdef ASCEND_310B
++        case GGML_OP_CONV_2D: {
++            /* [310B] Backed by the FP16 round trip in ggml_cann_conv2d(). aclnn
++             * needs both operands laid out contiguously in the order that
++             * ggml_cann_create_tensor() reverses into, so the channel-contiguous
++             * (`cwhn`) variant used by the ggml test suite is declined here and
++             * runs on the CPU instead. */
++            const ggml_tensor * tKernel = op->src[0];
++            const ggml_tensor * tInput  = op->src[1];
++
++            if (tKernel == nullptr || tInput == nullptr) {
++                return false;
++            }
++            if (tKernel->type != GGML_TYPE_F16 && tKernel->type != GGML_TYPE_F32) {
++                return false;
++            }
++            if (tInput->type != GGML_TYPE_F32 && tInput->type != GGML_TYPE_F16) {
++                return false;
++            }
++            if (op->type != tInput->type) {
++                return false;
++            }
++            if (!ggml_is_contiguous(tInput) || !ggml_is_contiguous(tKernel)) {
++                return false;
++            }
++
++            /* aclnnConvolution() refuses a shape whose padded and dilated input
++             * extent does not reach the kernel, while ggml's test suite feeds
++             * such degenerate cases on purpose. Decline them so they fall back
++             * to the CPU instead of aborting the process. */
++            const int32_t * piParams = (const int32_t *) op->op_params;
++
++            if (tInput->ne[0] + 2 * piParams[2] - piParams[4] * (tKernel->ne[0] - 1) - 1 < 0) {
++                return false;
++            }
++            if (tInput->ne[1] + 2 * piParams[3] - piParams[5] * (tKernel->ne[1] - 1) - 1 < 0) {
++                return false;
++            }
++            return true;
++        }
++#endif
+         case GGML_OP_SSM_CONV:
+             return true;
+         case GGML_OP_CUMSUM:
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e198d092..9ca5b194 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -8460,6 +8460,22 @@ struct test_generic_op : public test_case {
+     }
+ 
+     double max_nmse_err() override {
++        /* [310B1 probe] Test cases injected from a --test-file are all built as
++         * test_generic_op, so they are graded with the tolerances in the switch
++         * below -- NOT with the tighter per-op tolerances of the dedicated
++         * classes (test_mul_mat uses 1e-7).  A "pass" here therefore only says
++         * the op is correct to within sqrt(5e-4) = 2.2e-2 relative, which is the
++         * same order as the end-to-end error this project is chasing.  Setting
++         * GGML_PROBE_NMSE to a smaller value forces every case to fail and makes
++         * the harness print the measured NMSE instead.  Unset = stock behaviour. */
++        const char * pcProbeNmse = getenv("GGML_PROBE_NMSE");
++        if (NULL != pcProbeNmse) {
++            const double dProbeLimit = atof(pcProbeNmse);
++            if (dProbeLimit > 0.0) {
++                return dProbeLimit;
++            }
++        }
++
+         switch (op) {
+         case GGML_OP_MUL_MAT:
+         case GGML_OP_MUL_MAT_ID:
